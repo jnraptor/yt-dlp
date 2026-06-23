@@ -1977,6 +1977,16 @@ from .toggle import (
     ToggleIE,
 )
 from .toggo import ToggoIE
+from .tokyomotion import (
+    OsakaMotionIE,
+    OsakaMotionSearchesIE,
+    OsakaMotionUserFavsIE,
+    OsakaMotionUserIE,
+    TokyoMotionIE,
+    TokyoMotionSearchesIE,
+    TokyoMotionUserFavsIE,
+    TokyoMotionUserIE,
+)
 from .tonline import TOnlineIE
 from .toongoggles import ToonGogglesIE
 from .toutiao import ToutiaoIE
