@@ -4,35 +4,56 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 PYTHON_BIN="${PYTHON:-python3}"
-MODE="unix"   # unix | pyinstaller | sdist
-JOBS=""
+MODE="unix"
+JOBS=()
+
+CHANNEL="${CHANNEL:-stable}"
+ORIGIN="${ORIGIN:-local}"
+VERSION="${VERSION:-}"
+SKIP_PREPARE="${SKIP_PREPARE:-}"
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [MODE] [extra pyinstaller args]
 
 Modes:
-  unix         (default) Build the platform-independent UNIX binary via 'make'
-                          plus the sdist/wheel (what 'make all' does).
-  pyinstaller  Build the standalone PyInstaller executable (matches README
-                          'Standalone PyInstaller Builds' section). Extra args
-                          are forwarded to 'python -m bundle.pyinstaller'
-                          (e.g. --onefile / -F, --onedir / -D).
-  sdist        Build only the sdist and wheel (no yt-dlp binary).
+  unix         (default) Run the same steps as the CI 'unix' job in
+                          .github/workflows/build.yml:
+                              update-version -> update_changelog ->
+                              make_lazy_extractors -> 'make all-extra tar'
+                          If pandoc is missing this falls back to
+                          'make yt-dlp-extra' (binary only, per the
+                          README note that pandoc is not needed for the
+                          binary).
+  pyinstaller  Build the standalone PyInstaller executable (matches
+                          README 'Standalone PyInstaller Builds' section).
+                          Extra args are forwarded to
+                          'python -m bundle.pyinstaller'
+                          (e.g. --onefile/-F, --onedir/-D).
+  sdist        Build only the sdist + wheel (requires pandoc).
 
 Environment:
-  PYTHON=python3.12   Override the Python interpreter used for the venv.
+  PYTHON=python3.12    Override the Python interpreter used for the venv.
+  CHANNEL=stable        Update channel passed to update-version.py
+                        (matches workflow input.channel).
+  ORIGIN=local          Update origin passed to update-version.py
+                        (matches workflow input.origin / repo).
+  VERSION=YYYY.MM.DD    Version to stamp into yt_dlp/version.py
+                        (matches workflow input.version). Empty = let
+                        update-version.py auto-generate from the date.
+  SKIP_PREPARE=1        Skip the update-version / update_changelog /
+                        make_lazy_extractors prepare steps. The Makefile
+                        will still run make_lazy_extractors as needed.
 EOF
 }
 
 case "${1:-}" in
-    "")         MODE="unix" ;;
-    unix)       MODE="unix" ;;
+    "")          MODE="unix" ;;
+    unix)        MODE="unix" ;;
     pyinstaller) MODE="pyinstaller"; shift; JOBS=("$@") ;;
-    sdist)      MODE="sdist" ;;
-    -h|--|--help|help) usage; exit 0 ;;
+    sdist)       MODE="sdist" ;;
+    -h|--help|help) usage; exit 0 ;;
     *)
-        # Backwards compat: treat unknown first arg as pyinstaller extras
         MODE="pyinstaller"
         JOBS=("$@")
         ;;
@@ -60,26 +81,47 @@ source "${VENV_DIR}/bin/activate"
 
 python -m pip install --upgrade pip wheel
 
+run_prepare() {
+    if [ -n "${SKIP_PREPARE}" ]; then
+        log "SKIP_PREPARE set: skipping update-version / update_changelog / make_lazy_extractors"
+        return
+    fi
+
+    if [ -n "${VERSION}" ]; then
+        log "Updating version: channel=${CHANNEL} origin=${ORIGIN} version=${VERSION}"
+        python devscripts/update-version.py -c "${CHANNEL}" -r "${ORIGIN}" "${VERSION}"
+    else
+        log "Updating version: channel=${CHANNEL} origin=${ORIGIN} (auto)"
+        python devscripts/update-version.py -c "${CHANNEL}" -r "${ORIGIN}"
+    fi
+
+    log "Updating changelog"
+    python devscripts/update_changelog.py -vv
+
+    log "Generating lazy extractors"
+    python devscripts/make_lazy_extractors.py
+}
+
 case "${MODE}" in
     unix)
-        log "Installing project (editable) with build/default extras"
-        pip install -e ".[default,build]"
+        log "Installing build tooling via devscripts/install_deps.py"
+        python devscripts/install_deps.py --include-group build
+
+        run_prepare
 
         if command -v pandoc >/dev/null 2>&1; then
-            log "Building docs + standalone UNIX binary (make all)"
-            make all
-        else
-            log "pandoc missing: building docs sans manpage/README.txt + binary"
-            make \
-                README.md CONTRIBUTORS issuetemplates supportedsites \
-                completion-bash completion-fish completion-zsh \
-                lazy-extractors yt-dlp pypi-files
+            log "pandoc present: running 'make all-extra tar' (matches CI)"
+            make all-extra tar
             log "Building sdist + wheel"
             python -m build -sn .
+        else
+            log "pandoc missing: building only the EJS UNIX binary ('make yt-dlp-extra')"
+            make yt-dlp-extra
         fi
 
         log "Build complete. Artifacts:"
         ls -lh yt-dlp 2>/dev/null || true
+        ls -lh yt-dlp.tar.gz 2>/dev/null || true
         ls -lh dist/  2>/dev/null || true
         ;;
 
@@ -87,20 +129,28 @@ case "${MODE}" in
         log "Installing pyinstaller dependency group via devscripts/install_deps.py"
         python devscripts/install_deps.py --include-group pyinstaller
 
-        log "Generating lazy extractors"
-        python devscripts/make_lazy_extractors.py
+        run_prepare
 
-        log "Running pyinstaller bundle: python -m bundle.pyinstaller ${JOBS[*]-}"
-        # shellcheck disable=SC2068
-        python -m bundle.pyinstaller ${JOBS[@]-}
+        if [ "${#JOBS[@]}" -gt 0 ]; then
+            log "Running pyinstaller bundle: python -m bundle.pyinstaller ${JOBS[*]}"
+            python -m bundle.pyinstaller "${JOBS[@]}"
+        else
+            log "Running pyinstaller bundle: python -m bundle.pyinstaller"
+            python -m bundle.pyinstaller
+        fi
 
         log "PyInstaller build complete. Artifacts:"
-        ls -lh dist/  2>/dev/null || true
+        ls -lh dist/ 2>/dev/null || true
         ;;
 
     sdist)
+        if ! command -v pandoc >/dev/null 2>&1; then
+            err "pandoc is required for the sdist (manpage + README.txt)"
+            exit 1
+        fi
         log "Installing build tooling"
-        pip install -e ".[default,build]"
+        python devscripts/install_deps.py --include-group build
+        run_prepare
         log "Preparing PyPI files and building sdist + wheel"
         make pypi-files
         python -m build -sn .
